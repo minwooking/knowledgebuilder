@@ -183,10 +183,11 @@ def detect_duplicates(issues: list[dict], threshold: float = 0.75) -> list[list[
         for i in issues
     ]
 
+    # char_wb n-gram: 한국어/일본어 등 공백 없는 언어에서도 유효
     vect = TfidfVectorizer(
         min_df=1,
-        ngram_range=(1, 2),
-        strip_accents="unicode",
+        analyzer="char_wb",
+        ngram_range=(2, 4),
         sublinear_tf=True,
     )
     try:
@@ -207,7 +208,9 @@ def detect_duplicates(issues: list[dict], threshold: float = 0.75) -> list[list[
                 group.append(j)
                 visited.add(j)
         if len(group) > 1:
-            groups.append([issues[k] for k in group])
+            # 가장 오래된 이슈(번호 낮은)를 맨 앞(대표)으로 정렬
+            group_issues = sorted([issues[k] for k in group], key=lambda x: x["number"])
+            groups.append(group_issues)
         visited.add(i)
 
     return groups
@@ -224,12 +227,20 @@ RESOLVED_KEYWORDS = re.compile(
 STALE_DAYS = int(os.environ.get("STALE_DAYS", "30"))
 
 
+BOT_LABELS = {"bot", "issue-management", "automated"}
+
+
 def is_likely_resolved(issue: dict) -> str | None:
     """
     종결로 볼 수 있는 이유를 문자열로 반환; 해당없으면 None.
     """
-    # 라벨에 resolved / won't fix / duplicate 포함
     labels = [l["name"].lower() for l in issue.get("labels", [])]
+
+    # 봇이 생성한 보고 이슈는 자동 종결 대상 제외
+    if any(lbl in BOT_LABELS for lbl in labels):
+        return None
+
+    # 라벨에 resolved / won't fix / duplicate 포함
     if any(kw in lbl for kw in ("resolved", "wontfix", "won't fix", "duplicate", "invalid")
            for lbl in labels):
         return f"라벨: {labels}"
@@ -269,21 +280,23 @@ def build_user_summaries(
     """
     user_map: dict[str, list[str]] = defaultdict(list)
 
-    # 중복 이슈
+    # 중복 이슈 — 그룹 전체 관계자를 한 번씩만 수신
     for group in duplicate_groups:
         keeper = group[0]
         dups = group[1:]
+        # 그룹 내 모든 관계자 수집 (중복 없이)
+        login_set: set[str] = set()
         for issue in group:
-            login_set = {issue["user"]["login"]}
+            login_set.add(issue["user"]["login"])
             for a in issue.get("assignees") or []:
                 login_set.add(a["login"])
-            msg = (
-                f"**[중복 이슈 그룹]** #{keeper['number']} 을 대표 이슈로 유지합니다.\n"
-                f"- 대표: #{keeper['number']} {keeper['title']}\n"
-                + "\n".join(f"- 중복: #{d['number']} {d['title']}" for d in dups)
-            )
-            for login in login_set:
-                user_map[login].append(msg)
+        msg = (
+            f"**[중복 이슈 그룹]** #{keeper['number']} 을 대표 이슈로 유지합니다.\n"
+            f"- 대표: #{keeper['number']} {keeper['title']}\n"
+            + "\n".join(f"- 중복: #{d['number']} {d['title']}" for d in dups)
+        )
+        for login in login_set:
+            user_map[login].append(msg)
 
     # 자동 종결 이슈
     for issue, reason in auto_closed:
