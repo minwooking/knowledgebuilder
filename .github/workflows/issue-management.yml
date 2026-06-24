@@ -1,0 +1,39 @@
+name: Issue Management Agent
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # 4시간마다 실행
+  workflow_dispatch:           # 수동 실행 가능
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  manage-issues:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests scikit-learn
+
+      - name: git fetch & pull
+        run: |
+          git fetch --prune origin
+          git pull origin main
+
+      - name: Run Issue Management Agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: minwooking/knowledgebuilder
+          REPO_PATH: ${{ github.workspace }}
+          DUPLICATE_THRESHOLD: "0.35"
+        run: python3 agents/run_agent.py
