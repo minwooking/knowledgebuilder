@@ -645,7 +645,7 @@ def main():
         close_issue(issue["number"])
         print(f"  → #{issue['number']} '{issue['title']}' 종결 ({reason})")
 
-    # 10. 잔여 오픈 이슈 담당자 알림
+    # 10. 잔여 오픈 이슈 목록 확정
     auto_closed_nums = {i["number"] for i, _ in auto_closed}
     remaining = [
         i for i in real_issues
@@ -653,27 +653,7 @@ def main():
         and i["number"] not in auto_closed_nums
     ]
 
-    print(f"\n[10] 잔여 이슈 담당자 알림 ({len(remaining)}건)")
-    if (dup_groups or auto_closed) and remaining:
-        for issue in remaining:
-            subject = "## 📌 이슈 현황 알림"
-            created = datetime.fromisoformat(issue["created_at"].replace("Z", "+00:00"))
-            days = (NOW_UTC - created).days
-            asgn = [a["login"] for a in issue.get("assignees") or []]
-            detail = (
-                f"이 이슈는 현재 **열린 상태 ({days}일째)**입니다.\n\n"
-                f"| 항목 | 내용 |\n|------|------|\n"
-                f"| 이슈 | #{issue['number']} |\n"
-                f"| 제목 | {issue['title']} |\n"
-                f"| 담당자 | {', '.join(f'@{a}' for a in asgn) if asgn else '_미지정_'} |\n\n"
-                f"{'⚠️ 담당자 지정을 권장합니다.' if not asgn else '진행 상황을 업데이트 해주세요.'}"
-            )
-            notify_person_on_issue(issue, subject, detail)
-            print(f"  → #{issue['number']} 알림 발송")
-    else:
-        print("  알림 조건 없음")
-
-    # 11. 요약 보고서 upsert
+    # 11. 요약 보고서 upsert (담당자 알림 전에 생성)
     print("\n[11] 요약 보고서 upsert")
     report_title, report_body = build_report(
         git_report, dup_groups, auto_closed, remaining, old_bot_issues
@@ -683,6 +663,49 @@ def main():
     action = new_issue.get("action", "")
     print(f"  → 보고서 {action}: #{new_issue.get('number','')} {report_url}")
 
+    # 12. 잔여 오픈 이슈 담당자/작성자 알림
+    print(f"\n[12] 잔여 이슈 담당자/작성자 알림 ({len(remaining)}건)")
+    today_kst = NOW_KST.strftime("%Y-%m-%d")
+    notified_count = 0
+    for issue in remaining:
+        # 오늘 이미 알림 코멘트를 남겼으면 스킵 (스팸 방지)
+        comments, _ = gh_request(
+            "GET",
+            f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{issue['number']}/comments"
+            f"?per_page=30&sort=updated&direction=desc"
+        )
+        already_notified = False
+        if isinstance(comments, list):
+            for c in comments:
+                c_login = c.get("user", {}).get("login", "")
+                c_body = c.get("body") or ""
+                if c_login in (REPO_OWNER, "github-actions[bot]") and today_kst in c_body:
+                    already_notified = True
+                    break
+
+        if already_notified:
+            print(f"  → #{issue['number']} 오늘 이미 알림 발송됨, 스킵")
+            continue
+
+        subject = "## 📌 이슈 현황 알림"
+        created = datetime.fromisoformat(issue["created_at"].replace("Z", "+00:00"))
+        days = (NOW_UTC - created).days
+        asgn = [a["login"] for a in issue.get("assignees") or []]
+        detail = (
+            f"이 이슈는 현재 **열린 상태 ({days}일째)**입니다.\n\n"
+            f"| 항목 | 내용 |\n|------|------|\n"
+            f"| 이슈 | #{issue['number']} |\n"
+            f"| 제목 | {issue['title']} |\n"
+            f"| 담당자 | {', '.join(f'@{a}' for a in asgn) if asgn else '_미지정_'} |\n"
+            f"| 보고서 | {report_url} |\n\n"
+            f"{'⚠️ 담당자 지정을 권장합니다.' if not asgn else '진행 상황을 업데이트 해주세요.'}"
+        )
+        notify_person_on_issue(issue, subject, detail)
+        notified_count += 1
+        print(f"  → #{issue['number']} 알림 발송 (@{issue['user']['login']})")
+    if not remaining:
+        print("  잔여 이슈 없음")
+
     # 최종 요약
     print(f"\n{bar}")
     print(f"  실행 완료  |  {NOW_KST.strftime('%Y-%m-%d %H:%M KST')}")
@@ -691,6 +714,7 @@ def main():
     print(f"  해결 종결:   {len(auto_closed)}건")
     print(f"  봇 정리:     {len(old_bot_issues)}건")
     print(f"  잔여 오픈:   {len(remaining)}건")
+    print(f"  알림 발송:   {notified_count}건")
     print(f"  보고서:      {report_url}")
     print(f"{bar}\n")
 
@@ -700,6 +724,7 @@ def main():
         "auto_closed": len(auto_closed),
         "bot_cleaned": len(old_bot_issues),
         "remaining_open": len(remaining),
+        "notified": notified_count,
         "report_url": report_url,
     }
 
