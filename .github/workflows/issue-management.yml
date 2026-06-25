@@ -1,4 +1,4 @@
-name: Issue Management Agent v2
+name: Issue Management Agent v3
 
 on:
   schedule:
@@ -27,7 +27,11 @@ jobs:
           git fetch --prune origin
           git pull origin main
 
-      - name: Run Issue Management Agent v2
+      - name: Install Claude CLI (optional, for AI duplicate detection)
+        continue-on-error: true
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Issue Management Agent v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_OWNER: minwooking
@@ -36,6 +40,8 @@ jobs:
           BASE_BRANCH: main
           DUPLICATE_THRESHOLD: "0.35"
           STALE_DAYS: "30"
-          MAX_REPORTS_PER_DAY: "1"
           DRY_RUN: "false"
+          USE_CLAUDE_AI: "true"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python3 agents/run_agent.py
+
