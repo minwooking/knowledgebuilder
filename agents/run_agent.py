@@ -327,7 +327,8 @@ def is_bot_report(issue: dict) -> bool:
     if label_names & BOT_LABELS:
         return True
     title = issue.get("title", "")
-    return title.startswith("[자동보고]") or title.startswith("[이슈 관리]") or title.startswith("[bot]")
+    return (title.startswith("[자동보고]") or title.startswith("[이슈 관리]")
+            or title.startswith("[이슈관리]") or title.startswith("[bot]"))
 
 
 def mentions(issue: dict) -> str:
@@ -364,6 +365,29 @@ def get_today_closed_bot_issues() -> list:
         and is_bot_report(i)
         and i.get("created_at", "")[:10] == today_str
     ]
+
+
+# ── 보고서 이슈 upsert ────────────────────────────────────────────────────────
+
+def upsert_report_issue(title: str, body: str, labels: list) -> dict:
+    """오늘 날짜의 보고서 이슈가 있으면 업데이트, 없으면 신규 생성 (열린 채 유지)."""
+    today_str = NOW_UTC.strftime("%Y-%m-%d")
+    all_open = get_open_issues()
+    for issue in all_open:
+        if is_bot_report(issue) and today_str in issue.get("created_at", ""):
+            result, _ = gh_request(
+                "PATCH",
+                f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{issue['number']}",
+                {"title": title, "body": body},
+            )
+            return {"action": "updated", "number": issue.get("number", 0),
+                    "html_url": issue.get("html_url", ""), **result}
+    result, _ = gh_request(
+        "POST",
+        f"/repos/{REPO_OWNER}/{REPO_NAME}/issues",
+        {"title": title, "body": body, "labels": labels},
+    )
+    return {"action": "created", **result}
 
 
 # ── 담당자별 개인 알림 코멘트 ────────────────────────────────────────────────
@@ -589,11 +613,15 @@ def main():
         close_issue(issue["number"])
         print(f"  → #{issue['number']} '{issue['title']}' 자동 종결 ({reason})")
 
-    # 9. 이전 봇 보고서 정리 (오픈 상태인 것만)
+    # 9. 이전 봇 보고서 정리 (오늘 것 제외, 이전 날짜 open 이슈만 close)
+    today_str = NOW_UTC.strftime("%Y-%m-%d")
     print("\n[9] 봇 보고서 정리")
     for b in bot_issues:
-        close_issue(b["number"])
-        print(f"  → #{b['number']} '{b['title']}' 정리")
+        if b.get("created_at", "")[:10] != today_str:
+            close_issue(b["number"])
+            print(f"  → #{b['number']} '{b['title']}' 정리 (이전 날짜)")
+        else:
+            print(f"  → #{b['number']} '{b['title']}' 오늘 보고서 — 유지")
 
     # 10. 잔여 실제 오픈 이슈
     all_processed_nums = (
@@ -617,25 +645,18 @@ def main():
             notify_person_on_issue(issue, subject, detail)
             print(f"  → #{issue['number']} 잔여 이슈 알림")
 
-    # 12. 요약 보고서 이슈 생성 (하루 MAX_REPORTS_PER_DAY 회 제한)
-    print("\n[11] 요약 보고서 이슈 생성")
-    new_issue_url = ""
-    if already_reported and not (dup_groups or auto_closed):
-        print(f"  ℹ️  오늘({NOW_UTC.strftime('%Y-%m-%d')}) 보고서가 이미 생성됨 — 건너뜀")
+    # 11. 요약 보고서 이슈 upsert (오늘 것이 있으면 업데이트, 없으면 신규 생성 — 열린 채 유지)
+    print("\n[11] 요약 보고서 이슈 upsert")
+    report_title, report_body = build_report(
+        git_report, dup_groups, auto_closed, remaining, bot_issues
+    )
+    new_issue = upsert_report_issue(report_title, report_body, ["bot", "issue-management"])
+    new_issue_url = new_issue.get("html_url", "")
+    action = new_issue.get("action", "")
+    if new_issue_url:
+        print(f"  → 보고서 이슈 {action}: #{new_issue.get('number')} {new_issue_url}")
     else:
-        report_title, report_body = build_report(
-            git_report, dup_groups, auto_closed, remaining, bot_issues
-        )
-        new_issue = create_issue(report_title, report_body, ["bot", "issue-management"])
-        new_issue_url = new_issue.get("html_url", "")
-        if new_issue_url:
-            print(f"  → 보고서 이슈 생성: {new_issue_url}")
-            # 생성 직후 close (기록용 이슈)
-            if new_issue.get("number") and not DRY_RUN:
-                close_issue(new_issue["number"])
-                print(f"  → #{new_issue['number']} 보고서 이슈 closed (기록 완료)")
-        else:
-            print(f"  → 보고서: {report_title}")
+        print(f"  → 보고서: {report_title} ({action})")
 
     # 최종 요약
     print(f"\n{bar}")
@@ -662,3 +683,4 @@ def main():
 if __name__ == "__main__":
     result = main()
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
