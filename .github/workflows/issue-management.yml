@@ -1,9 +1,9 @@
-name: Issue Management Agent
+name: Issue Management Agent v2
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # 4시간마다 실행
-  workflow_dispatch:           # 수동 실행 가능
+    - cron: "0 0 * * *"   # 매일 00:00 UTC (KST 09:00)
+  workflow_dispatch:        # 수동 실행
 
 permissions:
   issues: write
@@ -22,18 +22,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install requests scikit-learn
-
       - name: git fetch & pull
         run: |
           git fetch --prune origin
           git pull origin main
 
-      - name: Run Issue Management Agent
+      - name: Run Issue Management Agent v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPO: minwooking/knowledgebuilder
+          REPO_OWNER: minwooking
+          REPO_NAME: knowledgebuilder
           REPO_PATH: ${{ github.workspace }}
+          BASE_BRANCH: main
           DUPLICATE_THRESHOLD: "0.35"
+          STALE_DAYS: "30"
+          MAX_REPORTS_PER_DAY: "1"
+          DRY_RUN: "false"
         run: python3 agents/run_agent.py
