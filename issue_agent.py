@@ -389,7 +389,8 @@ def cleanup_old_bot_reports(all_open: list, master_num: Optional[int] = None) ->
 # ── 마스터 보고서 upsert ─────────────────────────────────────────────────────
 
 def upsert_report(git_report: dict, dup_groups: list, auto_closed: list,
-                  remaining_open: list, cleaned_up: int) -> Optional[int]:
+                  remaining_open: list, cleaned_up: int,
+                  existing_num: Optional[int] = None) -> Optional[int]:
     from datetime import timedelta as _td
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     kst_now = datetime.now(timezone(_td(hours=9)))
@@ -471,6 +472,13 @@ def upsert_report(git_report: dict, dup_groups: list, auto_closed: list,
     if DRY_RUN:
         print(f"  [DRY] 보고서:\n{body[:500]}...")
         return None
+
+    # 호출자가 이미 보고서 번호를 알고 있으면 바로 업데이트 (API 캐시 경쟁 방지)
+    if existing_num:
+        gh("PATCH", f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{existing_num}",
+           {"title": title, "body": body})
+        print(f"  보고서 #{existing_num} 업데이트 완료 → {title}")
+        return existing_num
 
     # 기존 마스터 보고서 탐색
     all_open = get_all_issues("open")
@@ -601,9 +609,9 @@ def main():
     cleaned = cleanup_old_bot_reports(updated_open2, master_num=report_num)
     if cleaned > 0:
         print(f"  이전 봇 보고서 {cleaned}건 정리 완료")
-        # 보고서 본문 업데이트 (정리 건수 반영)
+        # 보고서 본문 업데이트 (정리 건수 반영) — existing_num 전달로 중복 생성 방지
         final_open = get_all_issues("open")
-        upsert_report(git_report, dup_groups, auto_closed, final_open, cleaned)
+        upsert_report(git_report, dup_groups, auto_closed, final_open, cleaned, existing_num=report_num)
 
     # 6. 잔여 이슈 알림
     print("\n[6/6] 잔여 이슈 담당자/작성자 알림")
