@@ -1,9 +1,15 @@
-name: Issue Management Agent v3
+name: 이슈 관리 에이전트 v6
 
 on:
   schedule:
     - cron: "0 0 * * *"   # 매일 00:00 UTC (KST 09:00)
-  workflow_dispatch:        # 수동 실행
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (실제 변경 없이 테스트)"
+        required: false
+        default: "false"
+        type: boolean
 
 permissions:
   issues: write
@@ -13,35 +19,24 @@ jobs:
   manage-issues:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
         with:
           ref: main
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: git fetch & pull
         run: |
           git fetch --prune origin
           git pull origin main
 
-      - name: Install Claude CLI (optional, for AI duplicate detection)
-        continue-on-error: true
-        run: npm install -g @anthropic-ai/claude-code
-
-      - name: Run Issue Management Agent v3
+      - name: Run Issue Management Agent v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_OWNER: minwooking
           REPO_NAME: knowledgebuilder
           REPO_PATH: ${{ github.workspace }}
           BASE_BRANCH: main
-          DUPLICATE_THRESHOLD: "0.35"
+          SIMILARITY_THRESHOLD: "0.55"
           STALE_DAYS: "30"
-          DRY_RUN: "false"
-          USE_CLAUDE_AI: "true"
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python3 agents/run_agent.py
-
