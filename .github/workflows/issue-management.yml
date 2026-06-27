@@ -1,4 +1,4 @@
-name: 이슈 관리 에이전트 v10
+name: 이슈 관리 에이전트 v11
 
 on:
   schedule:
@@ -18,6 +18,10 @@ on:
         description: "Stale 이슈 기준 (일)"
         required: false
         default: "30"
+      notify_interval_hours:
+        description: "이슈 알림 최소 간격 (시간)"
+        required: false
+        default: "24"
 
 permissions:
   issues: write
@@ -37,7 +41,7 @@ jobs:
           git fetch --prune origin
           git pull origin main || echo "pull skipped"
 
-      - name: Run Issue Management Agent v10
+      - name: Run Issue Management Agent v11
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_OWNER: minwooking
@@ -46,5 +50,6 @@ jobs:
           BASE_BRANCH: main
           SIMILARITY_THRESHOLD: ${{ github.event.inputs.similarity_threshold || '0.40' }}
           STALE_DAYS: ${{ github.event.inputs.stale_days || '30' }}
+          NOTIFY_INTERVAL_HOURS: ${{ github.event.inputs.notify_interval_hours || '24' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python3 agents/run_agent.py
