@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-GitHub 이슈 관리 에이전트 v10
+GitHub 이슈 관리 에이전트 v11
 - git fetch & pull (로컬 경로 → API 폴백)
 - 전체 이슈 기반 중복 탐지 & 그룹화 (Jaccard + TF-IDF 하이브리드)
 - 종결 키워드/레이블 기반 자동 close
-- 담당자(assignee) 및 이슈 작성자에게 @멘션 댓글 알림
-- 보고서 이슈 1개만 유지 (이전 보고서 전부 종결)
+- 담당자(assignee) 및 이슈 작성자에게 @멘션 댓글 알림 (24h 스로틀)
+- 보고서 이슈 1개만 유지 — 새 이슈 생성 없이 기존 이슈 PATCH 업데이트
 """
 
 import os
@@ -28,22 +28,21 @@ BASE_BRANCH  = os.environ.get("BASE_BRANCH", "main")
 API_BASE     = "https://api.github.com"
 DRY_RUN      = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.40"))
-STALE_DAYS           = int(os.environ.get("STALE_DAYS", "30"))
+SIMILARITY_THRESHOLD  = float(os.environ.get("SIMILARITY_THRESHOLD", "0.40"))
+STALE_DAYS            = int(os.environ.get("STALE_DAYS", "30"))
+NOTIFY_INTERVAL_HOURS = int(os.environ.get("NOTIFY_INTERVAL_HOURS", "24"))
 
 KST = timezone(timedelta(hours=9))
 now_kst = datetime.now(KST)
 now_str = now_kst.strftime("%Y-%m-%d %H:%M KST")
 
-REPORT_MARKER = "<!-- issue-manager-v10 -->"
+REPORT_MARKER = "<!-- issue-manager-v11 -->"
 
-# 이전 버전 포함 모든 봇 보고서 마커
 ANY_MARKER_RE = re.compile(
-    r"<!-- (issue-manager|kb-issue-agent)[^\-]*(-v[0-9]+|-report|-final|-v3|-v4|-v5|-v6|-v7|-v8|-v9|-v10)? -->"
+    r"<!-- (issue-manager|kb-issue-agent)(-v[0-9]+|-report|-final)? -->"
 )
 BOT_TITLE_RE = re.compile(r"^\[(이슈관리|이슈 관리|자동보고)\]", re.I)
 
-# 종결 키워드
 RESOLVED_RE = re.compile(
     r"\b(fix(?:ed|es)?|resolve[sd]?|close[sd]?|done|completed?|"
     r"완료|해결|닫|종결|수정완료|구현완료|배포완료|적용완료|merged?|머지)\b",
@@ -57,6 +56,9 @@ STOP_WORDS = {
     "a", "an", "the", "in", "on", "at", "is", "of", "for", "and", "or", "to",
     "it", "that", "this", "be", "are", "was", "were",
 }
+
+_label_cache = None
+
 
 # ── GitHub API ────────────────────────────────────────────────────────────────
 def gh(method, path, body=None, params=None):
@@ -96,6 +98,33 @@ def get_all_issues(state="all"):
     return items
 
 
+def get_issue_comments(num):
+    comments, page = [], 1
+    while True:
+        batch = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{num}/comments",
+                   params={"per_page": 100, "page": page})
+        if not isinstance(batch, list) or not batch:
+            break
+        comments.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return comments
+
+
+def was_notified_recently(issue_num, interval_hours=NOTIFY_INTERVAL_HOURS):
+    """해당 이슈에 최근 interval_hours 이내 봇 알림이 있으면 True."""
+    comments = get_issue_comments(issue_num)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
+    for c in comments:
+        body = c.get("body", "")
+        if "이슈 관리 에이전트" in body or "issue-manager" in body or "자동 처리" in body:
+            created = datetime.fromisoformat(c["created_at"].replace("Z", "+00:00"))
+            if created > cutoff:
+                return True
+    return False
+
+
 def post_comment(num, body):
     if DRY_RUN:
         print(f"  [DRY] comment #{num}: {body[:80]}...")
@@ -113,6 +142,21 @@ def close_issue_api(num, reason="completed"):
     return result.get("state") == "closed"
 
 
+def ensure_label(name, color="cfd3d7", desc=""):
+    global _label_cache
+    if _label_cache is None:
+        _label_cache = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/labels", params={"per_page": 100})
+        if not isinstance(_label_cache, list):
+            _label_cache = []
+    if any(l.get("name") == name for l in _label_cache):
+        return
+    if not DRY_RUN:
+        new_label = gh("POST", f"/repos/{REPO_OWNER}/{REPO_NAME}/labels",
+                       {"name": name, "color": color, "description": desc})
+        if isinstance(new_label, dict) and new_label.get("name"):
+            _label_cache.append(new_label)
+
+
 def add_labels(num, labels):
     if DRY_RUN:
         return
@@ -121,31 +165,11 @@ def add_labels(num, labels):
     gh("POST", f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{num}/labels", {"labels": labels})
 
 
-def ensure_label(name, color="cfd3d7", desc=""):
-    existing = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/labels",
-                  params={"per_page": 100})
-    if isinstance(existing, list) and any(l.get("name") == name for l in existing):
-        return
-    if not DRY_RUN:
-        gh("POST", f"/repos/{REPO_OWNER}/{REPO_NAME}/labels",
-           {"name": name, "color": color, "description": desc})
-
-
-def create_issue(title, body, labels=None):
-    if DRY_RUN:
-        print(f"  [DRY] create issue: {title}")
-        return {"number": 0, "html_url": "(dry-run)"}
-    data = {"title": title, "body": body}
-    if labels:
-        data["labels"] = labels
-    return gh("POST", f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", data)
-
-
-# ── 보조 레이블 준비 ──────────────────────────────────────────────────────────
 def setup_labels():
     ensure_label("duplicate", "cfd3d7", "중복 이슈")
     ensure_label("bot", "0075ca", "봇이 생성한 이슈")
     ensure_label("issue-management", "e4e669", "이슈 관리 보고서")
+    ensure_label("needs-assignee", "fbca04", "담당자 미지정")
 
 
 # ── Git 동기화 ────────────────────────────────────────────────────────────────
@@ -166,7 +190,7 @@ def git_sync():
             except subprocess.TimeoutExpired:
                 result["status"] += "시간 초과\n"
     else:
-        result["mode"] = "api (로컬 저장소 없음)"
+        result["mode"] = "api"
         try:
             commit = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BASE_BRANCH}")
             if commit.get("sha"):
@@ -232,9 +256,7 @@ def find_duplicates(real_issues):
 
     all_tokens = [tokenize(issue_text(i)) for i in real_issues]
     idf = build_idf(all_tokens)
-
-    groups = []
-    assigned = set()
+    groups, assigned = [], set()
 
     for i in range(len(real_issues)):
         for j in range(i + 1, len(real_issues)):
@@ -282,7 +304,6 @@ def is_stale(issue):
     return delta.days >= STALE_DAYS
 
 
-# ── 보고서 이슈 판별 ─────────────────────────────────────────────────────────
 def is_bot_report(issue):
     if BOT_TITLE_RE.search(issue.get("title", "")):
         return True
@@ -290,33 +311,31 @@ def is_bot_report(issue):
     return bool(ANY_MARKER_RE.search(body))
 
 
-# ── 통합 보고서 이슈 생성 ─────────────────────────────────────────────────────
-def build_report_body(git_info, dup_groups, resolved_closed, stale_closed, open_issues, prev_closed):
-    git_section = f"""## 🔄 Git 동기화
-
-| 항목 | 내용 |
-|------|------|
-| 저장소 | `{REPO_OWNER}/{REPO_NAME}` |
-| 브랜치 | `{git_info['branch']}` |
-| 모드 | {git_info['mode']} |
-| 상태 | {git_info['status'].strip().replace(chr(10), ' / ') or '정상'} |
-"""
+# ── 보고서 본문 작성 ──────────────────────────────────────────────────────────
+def build_report_body(git_info, dup_groups, resolved_closed, stale_closed, open_issues):
+    git_section = (
+        f"## 🔄 Git 동기화\n\n"
+        f"| 항목 | 내용 |\n|------|------|\n"
+        f"| 저장소 | `{REPO_OWNER}/{REPO_NAME}` |\n"
+        f"| 브랜치 | `{git_info['branch']}` |\n"
+        f"| 모드 | {git_info['mode']} |\n"
+        f"| 상태 | {git_info['status'].strip().replace(chr(10), ' / ') or '정상'} |\n\n"
+    )
 
     if dup_groups:
         dup_section = f"## 🔗 중복 이슈 그룹 ({len(dup_groups)}건)\n\n"
         for idx, members in enumerate(dup_groups, 1):
             dup_section += f"### 그룹 {idx}\n"
             for m in members:
-                status_icon = "🟢" if m["state"] == "open" else "⚫"
-                dup_section += f"- {status_icon} #{m['number']} {m['title']} (`{m['state']}`)\n"
+                icon = "🟢" if m["state"] == "open" else "⚫"
+                dup_section += f"- {icon} #{m['number']} {m['title']} (`{m['state']}`)\n"
             dup_section += "\n"
     else:
         dup_section = "## 🔗 중복 이슈 그룹\n\n중복 없음\n\n"
 
-    auto_section = ""
-    if resolved_closed or stale_closed:
-        total = len(resolved_closed) + len(stale_closed)
-        auto_section = f"## ✅ 자동 종결 ({total}건)\n\n"
+    auto_total = len(resolved_closed) + len(stale_closed)
+    if auto_total:
+        auto_section = f"## ✅ 자동 종결 ({auto_total}건)\n\n"
         for i in resolved_closed:
             auto_section += f"- ✅ #{i['number']} {i['title']} — 해결 완료 감지\n"
         for i in stale_closed:
@@ -327,60 +346,80 @@ def build_report_body(git_info, dup_groups, resolved_closed, stale_closed, open_
 
     if open_issues:
         open_section = f"## 📌 열린 이슈 ({len(open_issues)}건)\n\n"
-        open_section += "| # | 제목 | 레이블 | 담당자 | 작성자 |\n"
-        open_section += "|---|------|--------|--------|--------|\n"
+        open_section += "| # | 제목 | 레이블 | 담당자 | 작성자 | 생성일 |\n"
+        open_section += "|---|------|--------|--------|--------|--------|\n"
         for i in open_issues:
             labels_str = " ".join(f"`{l['name']}`" for l in i.get("labels", [])) or "없음"
             assignees = ", ".join(f"@{a['login']}" for a in i.get("assignees", [])) or "미지정"
             author = f"@{i['user']['login']}"
             created = i["created_at"][:10]
-            open_section += f"| #{i['number']} | {i['title']} | {labels_str} | {assignees} | {author} ({created}) |\n"
+            open_section += f"| #{i['number']} | {i['title']} | {labels_str} | {assignees} | {author} | {created} |\n"
         open_section += "\n"
     else:
-        open_section = "## 📌 열린 이슈\n\n없음\n\n"
+        open_section = "## 📌 열린 이슈\n\n없음 — 모두 처리됨 ✅\n\n"
 
-    prev_note = ""
-    if prev_closed:
-        prev_note = f"\n> 이전 보고서 #{', #'.join(str(n) for n in prev_closed[:5])}"
-        if len(prev_closed) > 5:
-            prev_note += f" 외 {len(prev_closed)-5}건"
-        prev_note += " 종결 처리됨\n"
+    return (
+        f"{REPORT_MARKER}\n"
+        f"# 📋 이슈 관리 통합 보고서\n\n"
+        f"**업데이트:** {now_str}\n"
+        f"**에이전트:** Claude Code (claude-sonnet-4-6) v11\n"
+        f"**알림 스로틀:** {NOTIFY_INTERVAL_HOURS}h | "
+        f"**stale 기준:** {STALE_DAYS}일 | "
+        f"**중복 임계값:** {SIMILARITY_THRESHOLD}\n\n"
+        f"---\n\n{git_section}---\n\n{dup_section}---\n\n{auto_section}---\n\n{open_section}"
+        f"---\n\n"
+        f"*이 보고서는 이슈 관리 에이전트가 자동 생성합니다. "
+        f"매시간 이 이슈 본문을 직접 업데이트합니다 (새 이슈 생성 없음).*\n\n"
+        f"_Generated by [Claude Code](https://claude.ai/code)_"
+    )
 
-    return f"""{REPORT_MARKER}
-# 📋 이슈 관리 통합 보고서
 
-**업데이트:** {now_str}
-**에이전트:** Claude Code (claude-sonnet-4-6) v10
-**모드:** GitHub API
+# ── 보고서 이슈 찾기/업데이트/생성 ───────────────────────────────────────────
+def upsert_report(all_issues, report_body):
+    """기존 열린 마스터 보고서를 PATCH로 업데이트. 없으면 새로 생성."""
+    open_reports = sorted(
+        [r for r in all_issues if is_bot_report(r) and r["state"] == "open"],
+        key=lambda r: r["number"], reverse=True
+    )
 
----
+    report_title = f"[이슈관리] 통합 정리 보고서 (최신: {now_str})"
 
-{git_section}
----
+    if open_reports:
+        master = open_reports[0]
+        # 중복 열린 봇 보고서는 닫기
+        for extra in open_reports[1:]:
+            close_issue_api(extra["number"], reason="not_planned")
+            add_labels(extra["number"], ["duplicate"])
+            print(f"  중복 보고서 종결: #{extra['number']}")
 
-{dup_section}
----
-
-{auto_section}
----
-
-{open_section}
----
-{prev_note}
-*이 보고서는 이슈 관리 에이전트가 자동 생성했습니다.*
-"""
+        if DRY_RUN:
+            print(f"  [DRY] PATCH #{master['number']}: {report_title}")
+            return master
+        result = gh("PATCH", f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{master['number']}",
+                    {"title": report_title, "body": report_body})
+        print(f"  보고서 업데이트: #{result.get('number', '?')} {result.get('html_url', '')}")
+        return result
+    else:
+        # 마스터 보고서가 없으면 새로 생성
+        if DRY_RUN:
+            print(f"  [DRY] CREATE: {report_title}")
+            return {"number": 0, "html_url": "(dry-run)"}
+        result = gh("POST", f"/repos/{REPO_OWNER}/{REPO_NAME}/issues",
+                    {"title": report_title, "body": report_body, "labels": ["bot", "issue-management"]})
+        print(f"  보고서 생성: #{result.get('number', '?')} {result.get('html_url', '')}")
+        return result
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 55)
-    print("  KnowledgeBuilder Issue Manager v10")
+    print("=" * 60)
+    print("  KnowledgeBuilder Issue Manager v11")
     print(f"  실행: {now_str}")
+    print(f"  스로틀: {NOTIFY_INTERVAL_HOURS}h | stale: {STALE_DAYS}일 | 중복임계: {SIMILARITY_THRESHOLD}")
     if DRY_RUN:
         print("  [DRY RUN 모드 — 실제 변경 없음]")
-    print("=" * 55)
+    print("=" * 60)
 
-    # 레이블 준비
     setup_labels()
 
     # 1. Git sync
@@ -393,41 +432,36 @@ def main():
     print("\n[2/6] 이슈 로드...")
     all_issues = get_all_issues("all")
     real_issues = [i for i in all_issues if not is_bot_report(i)]
-    bot_reports = [i for i in all_issues if is_bot_report(i)]
     open_real = [i for i in real_issues if i["state"] == "open"]
     print(f"  실제 이슈: {len(real_issues)}건 (open: {len(open_real)}건)")
-    print(f"  봇 보고서: {len(bot_reports)}건")
+    print(f"  봇 보고서: {len([i for i in all_issues if is_bot_report(i)])}건")
 
-    # 3. 중복 탐지
+    # 3. 중복 탐지 (전체 이슈 대상, 오픈 이슈만 처리)
     print("\n[3/6] 중복 이슈 탐지...")
-    dup_groups = find_duplicates(real_issues)
+    dup_groups = find_duplicates(open_real)
     print(f"  중복 그룹: {len(dup_groups)}개 발견")
 
-    dup_notified = []
     for members in dup_groups:
         nums_str = ", ".join(f"#{m['number']}" for m in members)
         print(f"  그룹: {nums_str}")
-        open_members = [m for m in members if m["state"] == "open"]
-        if len(open_members) > 1:
-            canonical = open_members[0]  # 번호 큰 게 최신
-            for dupe in open_members[1:]:
+        if len(members) > 1:
+            canonical = members[0]
+            for dupe in members[1:]:
                 add_labels(dupe["number"], ["duplicate"])
-                comment = (
-                    f"@{dupe['user']['login']}\n\n"
-                    f"이 이슈는 #{canonical['number']} **{canonical['title']}** 와 중복으로 감지되었습니다.\n\n"
-                    f"> 그룹 구성원: {nums_str}\n\n"
-                    f"#{canonical['number']} 에서 계속 논의해 주세요. "
-                    f"잘못된 판정이라면 `duplicate` 레이블을 제거하고 댓글로 알려주세요."
-                )
-                post_comment(dupe["number"], comment)
-                dup_notified.append(dupe["number"])
+                if not was_notified_recently(dupe["number"]):
+                    post_comment(dupe["number"], (
+                        f"@{dupe['user']['login']}\n\n"
+                        f"이 이슈는 #{canonical['number']} **{canonical['title']}** 와 중복으로 감지되었습니다.\n\n"
+                        f"> 그룹 구성원: {nums_str}\n\n"
+                        f"#{canonical['number']} 에서 계속 논의해 주세요. "
+                        f"잘못된 판정이라면 `duplicate` 레이블을 제거하고 댓글로 알려주세요."
+                    ))
 
-    # 4. 해결/stale 이슈 종결
+    # 4. 해결/stale 이슈 자동 종결
     print("\n[4/6] 이슈 자동 종결...")
     resolved_closed, stale_closed = [], []
     for issue in open_real:
-        mentions = set()
-        mentions.add("@" + issue["user"]["login"])
+        mentions = {"@" + issue["user"]["login"]}
         for a in issue.get("assignees", []):
             mentions.add("@" + a["login"])
         mention_str = " ".join(sorted(mentions))
@@ -436,7 +470,8 @@ def main():
             comment = (
                 f"{mention_str}\n\n"
                 f"이 이슈는 내용에 따라 **해결 완료**로 판단되어 자동 종결합니다.\n\n"
-                f"이슈가 실제로 미해결 상태라면 언제든지 다시 열어주세요."
+                f"이슈가 실제로 미해결 상태라면 언제든지 다시 열어주세요.\n\n"
+                f"_자동 처리: issue-manager-v11_"
             )
             if close_issue_api(issue["number"]):
                 post_comment(issue["number"], comment)
@@ -447,7 +482,8 @@ def main():
             comment = (
                 f"{mention_str}\n\n"
                 f"이 이슈는 **{STALE_DAYS}일 이상 업데이트가 없어** stale로 자동 종결합니다.\n\n"
-                f"여전히 유효한 이슈라면 다시 열어 진행 상황을 업데이트해 주세요."
+                f"여전히 유효한 이슈라면 다시 열어 진행 상황을 업데이트해 주세요.\n\n"
+                f"_자동 처리: issue-manager-v11_"
             )
             if close_issue_api(issue["number"], reason="not_planned"):
                 post_comment(issue["number"], comment)
@@ -456,74 +492,66 @@ def main():
 
     print(f"  해결 종결: {len(resolved_closed)}건 | stale 종결: {len(stale_closed)}건")
 
-    # 5. 남은 오픈 이슈 알림
-    print("\n[5/6] 열린 이슈 담당자/작성자 알림...")
+    # 5. 남은 오픈 이슈 알림 (스로틀 적용)
+    print(f"\n[5/6] 열린 이슈 알림 (최근 {NOTIFY_INTERVAL_HOURS}h 내 알림 있으면 스킵)...")
     closed_set = {i["number"] for i in resolved_closed + stale_closed}
     remaining_open = [i for i in open_real if i["number"] not in closed_set]
-    notified = []
+    notified, skipped = [], []
+
     for issue in remaining_open:
-        mentions = set()
-        mentions.add("@" + issue["user"]["login"])
+        if was_notified_recently(issue["number"]):
+            skipped.append(issue["number"])
+            print(f"  스킵 (최근 알림 있음): #{issue['number']}")
+            continue
+
+        mentions = {"@" + issue["user"]["login"]}
         for a in issue.get("assignees", []):
             mentions.add("@" + a["login"])
         mention_str = " ".join(sorted(mentions))
         labels_str = ", ".join(f"`{l['name']}`" for l in issue.get("labels", [])) or "없음"
+        days_open = (datetime.now(timezone.utc) -
+                     datetime.fromisoformat(issue["created_at"].replace("Z", "+00:00"))).days
 
         comment = (
             f"{mention_str}\n\n"
             f"**[이슈 관리 에이전트] 정기 현황 알림** — {now_str}\n\n"
-            f"| 항목 | 내용 |\n"
-            f"|------|------|\n"
+            f"| 항목 | 내용 |\n|------|------|\n"
             f"| 이슈 | #{issue['number']} |\n"
+            f"| 제목 | {issue['title']} |\n"
             f"| 레이블 | {labels_str} |\n"
-            f"| 생성일 | {issue['created_at'][:10]} |\n\n"
-            f"진행 상황을 업데이트하거나 담당자를 지정해 주세요."
+            f"| 오픈 기간 | {days_open}일째 |\n\n"
+            f"진행 상황을 업데이트하거나 담당자를 지정해 주세요.\n\n"
+            f"_자동 알림: issue-manager-v11 (다음 알림: {NOTIFY_INTERVAL_HOURS}h 후)_"
         )
         if post_comment(issue["number"], comment):
             notified.append(issue["number"])
-            print(f"  알림: #{issue['number']} → {mention_str}")
+            print(f"  알림 발송: #{issue['number']} → {mention_str}")
 
-    # 6. 보고서 생성
-    print("\n[6/6] 보고서 업데이트...")
+    # 6. 보고서 업데이트 (PATCH — 새 이슈 생성하지 않음)
+    print("\n[6/6] 보고서 업데이트 (기존 이슈 PATCH)...")
+    report_body = build_report_body(git_info, dup_groups, resolved_closed, stale_closed, remaining_open)
+    report = upsert_report(all_issues, report_body)
 
-    # 이전 열린 보고서 모두 Close
-    open_reports = [r for r in bot_reports if r["state"] == "open"]
-    prev_closed = []
-    for r in open_reports:
-        if close_issue_api(r["number"], reason="not_planned"):
-            prev_closed.append(r["number"])
-    if prev_closed:
-        print(f"  이전 보고서 종결: #{', #'.join(str(n) for n in prev_closed)}")
-
-    # 새 보고서 생성
-    report_body = build_report_body(
-        git_info, dup_groups, resolved_closed, stale_closed, remaining_open, prev_closed
-    )
-    report_title = f"[이슈관리] 통합 정리 보고서 (최신: {now_str})"
-    new_report = create_issue(report_title, report_body, ["bot", "issue-management"])
-    print(f"  새 보고서: #{new_report.get('number', '?')} {new_report.get('html_url', '')}")
-
-    # ── 요약 출력 ─────────────────────────────────────────────────────────────
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 60)
     print("  실행 결과 요약")
-    print("=" * 55)
+    print("=" * 60)
     print(f"  Git 모드:       {git_info['mode']}")
     print(f"  실제 이슈:      {len(real_issues)}건 (open {len(open_real)}건)")
     print(f"  중복 그룹:      {len(dup_groups)}개")
     print(f"  자동 종결:      {len(resolved_closed) + len(stale_closed)}건")
-    print(f"  알림 발송:      {len(notified)}건 — {notified}")
-    print(f"  이전 보고서:    {len(prev_closed)}건 종결")
-    print(f"  새 보고서:      #{new_report.get('number', '?')}")
-    print(f"  URL: {new_report.get('html_url', '')}")
-    print("=" * 55)
+    print(f"  알림 발송:      {len(notified)}건 {notified}")
+    print(f"  알림 스킵:      {len(skipped)}건 {skipped}")
+    print(f"  보고서:         #{report.get('number', '?')} {report.get('html_url', '')}")
+    print("=" * 60)
 
     return {
-        "report_number": new_report.get("number"),
-        "report_url": new_report.get("html_url"),
+        "report_number": report.get("number"),
+        "report_url": report.get("html_url"),
         "dup_groups": len(dup_groups),
         "resolved_closed": len(resolved_closed),
         "stale_closed": len(stale_closed),
         "notified": notified,
+        "skipped": skipped,
         "open_issues": len(remaining_open),
     }
 
