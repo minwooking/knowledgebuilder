@@ -1,8 +1,8 @@
-name: 이슈 관리 에이전트 v7
+name: 이슈 관리 에이전트 v10
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 매일 00:00 UTC (KST 09:00)
+    - cron: "0 * * * *"   # 매시간 (KST +9h)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -10,6 +10,14 @@ on:
         required: false
         default: "false"
         type: boolean
+      similarity_threshold:
+        description: "중복 탐지 유사도 임계값 (0.0~1.0)"
+        required: false
+        default: "0.40"
+      stale_days:
+        description: "Stale 이슈 기준 (일)"
+        required: false
+        default: "30"
 
 permissions:
   issues: write
@@ -27,16 +35,16 @@ jobs:
       - name: git fetch & pull
         run: |
           git fetch --prune origin
-          git pull origin main || git pull origin master || echo "pull skipped"
+          git pull origin main || echo "pull skipped"
 
-      - name: Run Issue Management Agent v7
+      - name: Run Issue Management Agent v10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_OWNER: minwooking
           REPO_NAME: knowledgebuilder
           REPO_PATH: ${{ github.workspace }}
           BASE_BRANCH: main
-          SIMILARITY_THRESHOLD: "0.55"
-          STALE_DAYS: "30"
+          SIMILARITY_THRESHOLD: ${{ github.event.inputs.similarity_threshold || '0.40' }}
+          STALE_DAYS: ${{ github.event.inputs.stale_days || '30' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python3 agents/run_agent.py
