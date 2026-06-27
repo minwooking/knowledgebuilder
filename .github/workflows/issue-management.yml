@@ -1,4 +1,4 @@
-name: 이슈 관리 에이전트 v6
+name: 이슈 관리 에이전트 v7
 
 on:
   schedule:
@@ -27,9 +27,9 @@ jobs:
       - name: git fetch & pull
         run: |
           git fetch --prune origin
-          git pull origin main
+          git pull origin main || git pull origin master || echo "pull skipped"
 
-      - name: Run Issue Management Agent v6
+      - name: Run Issue Management Agent v7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_OWNER: minwooking
