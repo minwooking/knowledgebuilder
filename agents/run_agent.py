@@ -196,8 +196,8 @@ def git_sync():
 
     if os.path.isdir(os.path.join(REPO_PATH, ".git")):
         result["mode"] = "local"
-        # 원격 URL을 HTTPS로 강제 설정 (SSH 우회, 프록시 통해 접근)
-        https_url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
+        # 토큰 포함 HTTPS URL로 강제 설정 (SSH 우회, GIT_CONFIG_COUNT=0 환경에서도 인증 보장)
+        https_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
         _run_git(["remote", "set-url", "origin", https_url])
 
         ok1, out1 = _run_git(["fetch", "--prune", "origin"])
