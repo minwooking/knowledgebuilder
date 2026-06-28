@@ -39,7 +39,7 @@ jobs:
       - name: git fetch & pull
         run: |
           git fetch --prune origin
-          git pull origin main || echo "pull skipped"
+          git pull origin main || git pull origin master || echo "pull skipped (both branches tried)"
 
       - name: Run Issue Management Agent v11
         env:
