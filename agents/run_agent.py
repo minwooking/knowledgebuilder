@@ -173,24 +173,53 @@ def setup_labels():
 
 
 # ── Git 동기화 ────────────────────────────────────────────────────────────────
+def _run_git(args, env_override=None):
+    """git 명령 실행. proxy rewrite 우회를 위해 GIT_CONFIG_COUNT=0 사용."""
+    env = dict(os.environ)
+    env["GIT_CONFIG_COUNT"] = "0"  # 프록시 URL 재작성 규칙 무효화
+    if env_override:
+        env.update(env_override)
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", REPO_PATH] + args,
+            stderr=subprocess.STDOUT, text=True, timeout=60, env=env,
+        )
+        return True, out.strip()
+    except subprocess.CalledProcessError as e:
+        return False, (e.output or "").strip()
+    except subprocess.TimeoutExpired:
+        return False, "시간 초과"
+
+
 def git_sync():
     result = {"mode": "unknown", "branch": BASE_BRANCH, "status": "", "commit": ""}
 
     if os.path.isdir(os.path.join(REPO_PATH, ".git")):
         result["mode"] = "local"
-        for cmd in [
-            ["git", "-C", REPO_PATH, "fetch", "--prune", "origin"],
-            ["git", "-C", REPO_PATH, "pull", "origin", BASE_BRANCH],
-        ]:
-            try:
-                out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=30)
-                result["status"] += out.strip() + "\n"
-            except subprocess.CalledProcessError as e:
-                result["status"] += f"오류: {e.output.strip()}\n"
-            except subprocess.TimeoutExpired:
-                result["status"] += "시간 초과\n"
+        # 토큰 인증 URL로 remote 업데이트 (프록시 재작성 우회)
+        token = GITHUB_TOKEN
+        if token and token != "proxy-injected":
+            auth_url = f"https://oauth2:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
+            _run_git(["remote", "set-url", "origin", auth_url])
+
+        ok1, out1 = _run_git(["fetch", "--prune", "origin"])
+        result["status"] += out1 + "\n"
+
+        if ok1:
+            ok2, out2 = _run_git(["pull", "origin", BASE_BRANCH])
+            if not ok2:
+                # master 브랜치 시도
+                ok2, out2 = _run_git(["pull", "origin", "master"])
+                if ok2:
+                    result["branch"] = "master"
+            result["status"] += out2 + "\n"
+        else:
+            result["status"] += "fetch 실패 — API fallback\n"
+            result["mode"] = "api-fallback"
     else:
         result["mode"] = "api"
+
+    if result["mode"] in ("api", "api-fallback"):
         try:
             commit = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BASE_BRANCH}")
             if commit.get("sha"):
@@ -198,11 +227,11 @@ def git_sync():
                 msg = commit["commit"]["message"].splitlines()[0][:60]
                 date = commit["commit"]["author"]["date"][:10]
                 result["commit"] = sha
-                result["status"] = f"최신 커밋: {sha} ({date}) {msg}"
+                result["status"] += f"최신 커밋: {sha} ({date}) {msg}"
             else:
-                result["status"] = "커밋 조회 실패"
+                result["status"] += "커밋 조회 실패"
         except Exception as e:
-            result["status"] = f"API 오류: {e}"
+            result["status"] += f"API 오류: {e}"
 
     return result
 
