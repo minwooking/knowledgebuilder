@@ -196,42 +196,40 @@ def git_sync():
 
     if os.path.isdir(os.path.join(REPO_PATH, ".git")):
         result["mode"] = "local"
-        # 토큰 인증 URL로 remote 업데이트 (프록시 재작성 우회)
-        token = GITHUB_TOKEN
-        if token and token != "proxy-injected":
-            auth_url = f"https://oauth2:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-            _run_git(["remote", "set-url", "origin", auth_url])
+        # 원격 URL을 HTTPS로 강제 설정 (SSH 우회, 프록시 통해 접근)
+        https_url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
+        _run_git(["remote", "set-url", "origin", https_url])
 
         ok1, out1 = _run_git(["fetch", "--prune", "origin"])
-        result["status"] += out1 + "\n"
-
         if ok1:
             ok2, out2 = _run_git(["pull", "origin", BASE_BRANCH])
             if not ok2:
-                # master 브랜치 시도
                 ok2, out2 = _run_git(["pull", "origin", "master"])
                 if ok2:
                     result["branch"] = "master"
-            result["status"] += out2 + "\n"
-        else:
-            result["status"] += "fetch 실패 — API fallback\n"
-            result["mode"] = "api-fallback"
+            if ok2:
+                result["status"] = out2.strip() or "Already up to date."
+                ok3, head = _run_git(["rev-parse", "--short", "HEAD"])
+                result["commit"] = head if ok3 else ""
+                return result
+        # fetch/pull 실패 → API fallback
+        result["mode"] = "api-fallback"
     else:
         result["mode"] = "api"
 
-    if result["mode"] in ("api", "api-fallback"):
-        try:
-            commit = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BASE_BRANCH}")
-            if commit.get("sha"):
-                sha = commit["sha"][:8]
-                msg = commit["commit"]["message"].splitlines()[0][:60]
-                date = commit["commit"]["author"]["date"][:10]
-                result["commit"] = sha
-                result["status"] += f"최신 커밋: {sha} ({date}) {msg}"
-            else:
-                result["status"] += "커밋 조회 실패"
-        except Exception as e:
-            result["status"] += f"API 오류: {e}"
+    # API 모드: GitHub REST API로 최신 커밋 조회
+    try:
+        commit = gh("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{BASE_BRANCH}")
+        if commit.get("sha"):
+            sha = commit["sha"][:8]
+            msg = commit["commit"]["message"].splitlines()[0][:60]
+            date = commit["commit"]["author"]["date"][:10]
+            result["commit"] = sha
+            result["status"] = f"최신 커밋: {sha} ({date}) {msg}"
+        else:
+            result["status"] = "커밋 조회 실패"
+    except Exception as e:
+        result["status"] = f"API 오류: {e}"
 
     return result
 
@@ -347,8 +345,9 @@ def build_report_body(git_info, dup_groups, resolved_closed, stale_closed, open_
         f"| 항목 | 내용 |\n|------|------|\n"
         f"| 저장소 | `{REPO_OWNER}/{REPO_NAME}` |\n"
         f"| 브랜치 | `{git_info['branch']}` |\n"
-        f"| 모드 | {git_info['mode']} |\n"
-        f"| 상태 | {git_info['status'].strip().replace(chr(10), ' / ') or '정상'} |\n\n"
+        f"| 커밋 | `{git_info.get('commit') or '-'}` |\n"
+        f"| 모드 | `{git_info['mode']}` |\n"
+        f"| 상태 | {git_info['status'].strip()[:120] or '정상'} |\n\n"
     )
 
     if dup_groups:
